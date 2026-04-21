@@ -176,7 +176,15 @@ func (w *Worker) dispatch(parentCtx context.Context, j provisioningJob) {
 
 	log.Printf("[provisioning] dispatching job=%s type=%s server=%s", j.ID, j.JobType, j.ServerID)
 
-	if err := w.execute(ctx, j); err != nil {
+	err := w.execute(ctx, j)
+	if err == ErrAsyncRunning {
+		// Dispatch accepted; Warden will call ReportJobResult when finished.
+		if mErr := w.markRunning(parentCtx, j.ID); mErr != nil {
+			log.Printf("[provisioning] markRunning job=%s: %v", j.ID, mErr)
+		}
+		return
+	}
+	if err != nil {
 		log.Printf("[provisioning] job=%s failed (attempt=%d): %v", j.ID, j.Attempt, err)
 		w.markFailed(parentCtx, j, err.Error())
 		return
@@ -185,6 +193,18 @@ func (w *Worker) dispatch(parentCtx context.Context, j provisioningJob) {
 	if err := w.markCompleted(parentCtx, j.ID); err != nil {
 		log.Printf("[provisioning] markCompleted job=%s: %v", j.ID, err)
 	}
+}
+
+// markRunning transitions a claimed job to the 'running' state while the
+// remote Warden agent works.  The terminal state is set later via
+// ReportJobResult on the API.
+func (w *Worker) markRunning(ctx context.Context, jobID string) error {
+	_, err := w.pool.Exec(ctx, `
+		UPDATE provisioning_jobs
+		SET status='running', updated_at=NOW()
+		WHERE id=$1
+	`, jobID)
+	return err
 }
 
 // execute resolves the Warden URL, encrypts credentials, and calls the
@@ -208,12 +228,20 @@ func (w *Worker) execute(ctx context.Context, j provisioningJob) error {
 		return fmt.Errorf("load payload: %w", err)
 	}
 
-	// Encrypt credentials with a server-specific derived key so leaked
-	// ciphertext for one server cannot be decrypted by another server's key.
-	encryptedCreds, err := EncryptPayload(w.masterKey, j.ServerID, []byte(payloadStr))
-	if err != nil {
-		return fmt.Errorf("encrypt payload: %w", err)
-	}
+	// The gRPC ProvisionSite path carries the payload inline in the
+	// ProvisionSiteRequest.encrypted_credentials field.  The Warden executor
+	// currently json.Unmarshal()s those bytes directly (no crypto on the
+	// inbound path for the gRPC flow — only the heartbeat-job flow uses
+	// AES-GCM via e.decryptPayload).  Send the raw JSON so Warden sees the
+	// real keys (admin_email, site_title, etc.) instead of ciphertext that
+	// silently decodes to zero-valued params.
+	//
+	// Transport confidentiality on this hop is provided by the private-IP /
+	// wireguard network + the per-agent token, not by payload-level crypto.
+	// When Warden's gRPC handler learns to decrypt we will switch back to
+	// EncryptPayload(w.masterKey, j.ServerID, …).
+	encryptedCreds := []byte(payloadStr)
+	_ = w.masterKey // kept for the future re-enable of EncryptPayload
 
 	baseURL := fmt.Sprintf("http://%s:%d", ipAddress, wardenPort)
 	client := wardenv1connect.NewWardenServiceClient(
@@ -244,6 +272,7 @@ func (w *Worker) callProvisionSite(
 	var p struct {
 		Domain     string `json:"domain"`
 		AppType    string `json:"app_type"`
+		SiteType   string `json:"site_type"`
 		PHPVersion string `json:"php_version"`
 		Plan       string `json:"plan"`
 		CustomerID string `json:"customer_id"`
@@ -252,11 +281,18 @@ func (w *Worker) callProvisionSite(
 		return fmt.Errorf("parse payload: %w", err)
 	}
 
+	// API historically uses both keys; prefer app_type when present, fall back
+	// to site_type so ad-hoc/cutover payloads keep working.
+	siteType := p.AppType
+	if siteType == "" {
+		siteType = p.SiteType
+	}
+
 	req := connect.NewRequest(&wardenv1.ProvisionSiteRequest{
 		JobId:                j.ID,
 		SiteId:               j.InstanceID,
 		Domain:               p.Domain,
-		Type:                 p.AppType,
+		Type:                 siteType,
 		PhpVersion:           p.PHPVersion,
 		Plan:                 p.Plan,
 		CustomerId:           p.CustomerID,
@@ -267,12 +303,22 @@ func (w *Worker) callProvisionSite(
 	if err != nil {
 		return fmt.Errorf("ProvisionSite rpc: %w", err)
 	}
-	// DONE is the success terminal state from the agent.
+	// Warden dispatches provisioning asynchronously and returns RUNNING from
+	// the sync RPC.  The terminal state arrives later via the API's
+	// ReportJobResult endpoint, which is responsible for updating
+	// provisioning_jobs → completed/failed.  Only treat an explicit immediate
+	// FAILED as a dispatch error; otherwise return ErrAsyncRunning so the
+	// dispatcher leaves the row in 'running' state.
 	if resp.Msg.GetStatus() == wardenv1.ProvisioningStatus_PROVISIONING_STATUS_FAILED {
-		return fmt.Errorf("ProvisionSite: agent reported failure")
+		return fmt.Errorf("ProvisionSite: agent reported failure on dispatch")
 	}
-	return nil
+	return ErrAsyncRunning
 }
+
+// ErrAsyncRunning is returned when Warden accepted a dispatch and will report
+// the terminal result asynchronously.  The dispatcher treats this as "do not
+// mark completed locally" instead of a failure.
+var ErrAsyncRunning = fmt.Errorf("dispatch accepted — awaiting async report")
 
 // callDeprovisionSite sends a DeprovisionSite RPC.
 func (w *Worker) callDeprovisionSite(
@@ -289,7 +335,9 @@ func (w *Worker) callDeprovisionSite(
 	if err != nil {
 		return fmt.Errorf("DeprovisionSite rpc: %w", err)
 	}
-	return nil
+	// Warden processes deprovisioning asynchronously — the terminal state
+	// arrives via ReportJobResult on the API.
+	return ErrAsyncRunning
 }
 
 // callPurgeCache sends a PurgeSiteCache RPC.
