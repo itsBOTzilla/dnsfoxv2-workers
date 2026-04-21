@@ -101,16 +101,22 @@ func (w *Worker) runSchedule(ctx context.Context) {
 func (w *Worker) enqueueBackup(ctx context.Context, s SiteBackupInfo, onDemand bool) error {
 	// Create a pending backup record so the dashboard shows it immediately.
 	var backupID string
+	// size_gb is NOT NULL in the schema and is only known after Warden
+	// completes the backup and reports back. Seed with 0 on creation; it is
+	// overwritten when ReportJobResult lands the final size.
 	if err := w.pool.QueryRow(ctx, `
 		INSERT INTO backups
-			(id, instance_id, customer_id, type, storage_location, status)
-		VALUES (gen_random_uuid(), $1, $2, 'full', 'b2', 'pending')
+			(id, instance_id, customer_id, type, storage_location, status, size_gb)
+		VALUES (gen_random_uuid(), $1, $2, 'full', 'b2', 'pending', 0)
 		RETURNING id::text
 	`, s.SiteID, s.CustomerID).Scan(&backupID); err != nil {
 		return err
 	}
 
 	// Insert the agent job.  Warden picks it up via heartbeat job polling.
+	// $2 (instance_id) is uuid; duplicating it inside jsonb_build_object leaves
+	// Postgres unable to infer a single type (VARIADIC "any") and produces
+	// 42P08. Pass the site_id separately as a text parameter for the payload.
 	_, err := w.pool.Exec(ctx, `
 		INSERT INTO agent_jobs
 			(id, server_id, instance_id, job_type, priority,
@@ -118,13 +124,13 @@ func (w *Worker) enqueueBackup(ctx context.Context, s SiteBackupInfo, onDemand b
 		VALUES
 			(gen_random_uuid(), $1, $2, 'backup_site', 3,
 			 jsonb_build_object(
-				 'backup_id', $3,
-				 'site_id', $2,
-				 'domain', $4,
-				 'plan', $5,
-				 'on_demand', $6
+				 'backup_id', $3::text,
+				 'site_id', $4::text,
+				 'domain', $5::text,
+				 'plan', $6::text,
+				 'on_demand', $7::boolean
 			 ), 'pending', 2)
-	`, s.ServerID, s.SiteID, backupID, s.Domain, s.Plan, onDemand)
+	`, s.ServerID, s.SiteID, backupID, s.SiteID, s.Domain, s.Plan, onDemand)
 	if err != nil {
 		return err
 	}

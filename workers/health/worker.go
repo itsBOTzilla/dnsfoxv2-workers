@@ -182,13 +182,16 @@ func (w *Worker) enqueueRestart(ctx context.Context, s siteRow) {
 		return
 	}
 
+	// $2 is a uuid column binding (instance_id) and can't also be inferred
+	// inside jsonb_build_object (VARIADIC "any"). Pass site_id separately
+	// as $3::text for the JSON payload; $4 becomes the domain.
 	if _, err := w.pool.Exec(ctx, `
 		INSERT INTO agent_jobs
 			(id, server_id, instance_id, job_type, priority, payload, status, max_attempts)
 		VALUES
 			(gen_random_uuid(), $1, $2, 'reload_nginx', 5,
-			 jsonb_build_object('site_id', $2, 'domain', $3), 'pending', 3)
-	`, s.ServerID, s.ID, s.Domain); err != nil {
+			 jsonb_build_object('site_id', $3::text, 'domain', $4::text), 'pending', 3)
+	`, s.ServerID, s.ID, s.ID, s.Domain); err != nil {
 		log.Printf("[health] enqueue restart error site=%s: %v", s.ID, err)
 	}
 }
