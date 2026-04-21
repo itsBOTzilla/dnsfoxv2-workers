@@ -71,16 +71,20 @@ func (w *Worker) run(ctx context.Context) {
 	w.logDiskWarnings(ctx)
 }
 
-// deleteSupportPins removes support PINs that have passed their expiry time.
+// deleteSupportPins nulls out expired support PINs on the customers table.
 func (w *Worker) deleteSupportPins(ctx context.Context) {
-	tag, err := w.pool.Exec(ctx,
-		`DELETE FROM support_pins WHERE expires_at < NOW()`)
+	tag, err := w.pool.Exec(ctx, `
+		UPDATE customers
+		SET support_pin = NULL, support_pin_expires_at = NULL
+		WHERE support_pin_expires_at < NOW()
+		  AND support_pin IS NOT NULL
+	`)
 	if err != nil {
-		log.Printf("[cleanup] delete support pins error: %v", err)
+		log.Printf("[cleanup] clear support pins error: %v", err)
 		return
 	}
 	if tag.RowsAffected() > 0 {
-		log.Printf("[cleanup] deleted %d expired support PINs", tag.RowsAffected())
+		log.Printf("[cleanup] cleared %d expired support PINs", tag.RowsAffected())
 	}
 }
 
