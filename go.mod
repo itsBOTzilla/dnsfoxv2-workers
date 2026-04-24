@@ -7,7 +7,7 @@ module github.com/itsBOTzilla/dnsfoxv2-workers
 go 1.26
 
 require (
-	connectrpc.com/connect v1.19.1
+	connectrpc.com/connect v1.19.2
 	github.com/google/uuid v1.6.0
 	github.com/itsBOTzilla/dnsfoxv2-proto v0.0.0
 	github.com/jackc/pgx/v5 v5.9.2
