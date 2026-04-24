@@ -122,7 +122,7 @@ func (w *Worker) enqueueBackup(ctx context.Context, s SiteBackupInfo, onDemand b
 			(id, server_id, instance_id, job_type, priority,
 			 payload, status, max_attempts)
 		VALUES
-			(gen_random_uuid(), $1, $2, 'backup_site', 3,
+			(gen_random_uuid(), $1, $2, 'backup_instance', 3,
 			 jsonb_build_object(
 				 'backup_id', $3::text,
 				 'site_id', $4::text,
