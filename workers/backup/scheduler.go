@@ -57,20 +57,25 @@ func (s *Scheduler) GetSitesDueForBackup(ctx context.Context) ([]SiteBackupInfo,
 			COALESCE(i.plan,'fox')
 		FROM instances i
 		WHERE i.status = 'active'
-		  AND (
-			  -- Site has never had a backup, or last backup exceeds plan interval.
-			  NOT EXISTS (
-				  SELECT 1 FROM backups b
-				  WHERE b.instance_id = i.id
-				    AND b.status = 'completed'
-				    AND b.deleted_at IS NULL
-				    AND b.created_at > NOW() - CASE i.plan
-						WHEN 'titan' THEN INTERVAL '24 hours'
-						WHEN 'apex'  THEN INTERVAL '24 hours'
-						WHEN 'swift' THEN INTERVAL '24 hours'
-						ELSE              INTERVAL '24 hours'
-					END
-			  )
+		  AND NOT EXISTS (
+			  -- Already has a recent completed backup within the plan interval.
+			  SELECT 1 FROM backups b
+			  WHERE b.instance_id = i.id
+			    AND b.status = 'completed'
+			    AND b.deleted_at IS NULL
+			    AND b.created_at > NOW() - CASE i.plan
+					WHEN 'titan' THEN INTERVAL '24 hours'
+					WHEN 'apex'  THEN INTERVAL '24 hours'
+					WHEN 'swift' THEN INTERVAL '24 hours'
+					ELSE              INTERVAL '24 hours'
+				END
+		  )
+		  AND NOT EXISTS (
+			  -- Already has a backup in flight — don't pile up duplicates.
+			  SELECT 1 FROM backups b
+			  WHERE b.instance_id = i.id
+			    AND b.status IN ('pending', 'queued', 'in_progress')
+			    AND b.deleted_at IS NULL
 		  )
 	`)
 	if err != nil {
